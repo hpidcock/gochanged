@@ -1,6 +1,6 @@
 # Go Changed :fire:
 
-`gochanged` lists all the packages that have untested changes compare to a base git branch/tag/sha.
+`gochanged` lists all the packages that have untested changes compared to a base git branch/tag/sha.
 
 ## Installing
 
