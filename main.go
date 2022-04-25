@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/juju/collections/set"
@@ -17,6 +18,30 @@ import (
 	"github.com/hpidcock/gochanged/git"
 	"github.com/hpidcock/gochanged/packages"
 )
+
+type ChangeLevel int
+
+const (
+	LevelNone ChangeLevel = iota
+	LevelTestOnly
+	LevelPackage
+)
+
+type Reasons struct {
+	PackageReasons set.Strings
+	TestReasons    set.Strings
+}
+
+func (r *Reasons) Set(level ChangeLevel) set.Strings {
+	switch level {
+	case LevelPackage:
+		return r.PackageReasons
+	case LevelTestOnly:
+		return r.TestReasons
+	default:
+		panic("invalid ChangeLevel")
+	}
+}
 
 func main() {
 	treeish := ""
@@ -38,42 +63,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	changedFiles, err := git.DiffNames(gitRoot, treeish)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
-	}
-	changedDirectories := make(map[string]bool)
-	for _, file := range changedFiles {
-		dir := path.Dir(file)
-		// TODO: detect if test data has changed.
-		changedDirectories[dir] = true
-	}
-
-	changedPackages := make(map[string]bool)
-	whyChanged := make(map[string][]string)
-	addReason := func(importPath string, reasons []string) {
-		if !why {
-			return
-		}
-		existingReasons := whyChanged[importPath]
-		s := set.NewStrings(existingReasons...)
-		for _, reason := range reasons {
-			s.Add(reason)
-		}
-		whyChanged[importPath] = s.Values()
-	}
 	pkgs, extraPkgs, err := packages.ImportAll(build.Default, wd, packagesFilter)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
-	}
-	allPkgs := append(append([]packages.Package(nil), pkgs...), extraPkgs...)
-	for _, v := range pkgs {
-		if changedDirectories[path.Clean(v.Dir)] {
-			changedPackages[v.ImportPath] = true
-			whyChanged[v.ImportPath] = append(whyChanged[v.ImportPath], fmt.Sprintf("package changed %s", v.ImportPath))
-		}
 	}
 
 	commonModFile := ""
@@ -90,6 +83,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "go.mod is not under git root")
 		os.Exit(1)
 	}
+	goModDir := path.Dir(commonModFile)
 	goModGitSubpath := strings.TrimLeft(strings.TrimPrefix(commonModFile, gitRoot), string(os.PathSeparator))
 
 	currentModFile, err := ioutil.ReadFile(commonModFile)
@@ -117,6 +111,38 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
+	}
+
+	changedDirectories := make(map[string]ChangeLevel)
+	changedPackages := make(map[string]ChangeLevel)
+	whyChanged := make(map[string]*Reasons)
+	addReason := func(importPath string, level ChangeLevel, newReasons ...string) int {
+		if changedPackages[importPath] < level {
+			changedPackages[importPath] = level
+		}
+		if !why {
+			return 0
+		}
+		reasons := whyChanged[importPath]
+		if reasons == nil {
+			reasons = &Reasons{
+				PackageReasons: set.NewStrings(),
+				TestReasons:    set.NewStrings(),
+			}
+			whyChanged[importPath] = reasons
+		}
+		s := reasons.Set(level)
+		count := len(s)
+		for _, reason := range newReasons {
+			s.Add(reason)
+		}
+		return len(s) - count
+	}
+	importReasons := func(importPath string) []string {
+		if reasons, ok := whyChanged[importPath]; ok && reasons != nil {
+			return reasons.PackageReasons.Values()
+		}
+		return nil
 	}
 
 	if workspace, err := packages.Workspace(build.Default, wd); err != nil {
@@ -158,13 +184,11 @@ func main() {
 		importPath := dep.Mod.Path
 		pastVer, ok := pastRequires[importPath]
 		if !ok {
-			changedPackages[importPath] = true
-			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("new dep %s", importPath))
+			addReason(importPath, LevelPackage, fmt.Sprintf("new dep %s", importPath))
 			continue
 		}
 		if dep.Mod.Version != pastVer.Version {
-			changedPackages[importPath] = true
-			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("changed dep %s", importPath))
+			addReason(importPath, LevelPackage, fmt.Sprintf("changed dep %s", importPath))
 			continue
 		}
 	}
@@ -173,61 +197,75 @@ func main() {
 		importPath := rep.Old.Path
 		pastRep, ok := pastReplace[importPath]
 		if !ok {
-			changedPackages[importPath] = true
-			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("new replace %s", importPath))
+			addReason(importPath, LevelPackage, fmt.Sprintf("new replace %s", importPath))
 			continue
 		}
 		delete(pastReplace, importPath)
 		if rep.Old.Version != pastRep.Old.Version ||
 			rep.New.Path != pastRep.New.Path ||
 			rep.New.Version != pastRep.New.Version {
-			changedPackages[importPath] = true
-			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("changed replace %s", importPath))
+			addReason(importPath, LevelPackage, fmt.Sprintf("changed replace %s", importPath))
 			continue
 		}
 	}
 	// Mark removed replaces as changed.
 	for importPath := range pastReplace {
-		changedPackages[importPath] = true
-		whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("removed replace %s", importPath))
+		addReason(importPath, LevelPackage, fmt.Sprintf("removed replace %s", importPath))
+	}
+
+	changedFiles, err := git.DiffNames(gitRoot, treeish)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	for _, file := range changedFiles {
+		changeLevel := LevelPackage
+		dir := path.Dir(file)
+		if strings.Contains(strings.TrimPrefix(dir, goModDir), "testdata") {
+			changeLevel = LevelTestOnly
+		} else if strings.HasSuffix(file, "_test.go") {
+			changeLevel = LevelTestOnly
+		}
+		if changeLevel > changedDirectories[dir] {
+			changedDirectories[dir] = changeLevel
+		}
+	}
+
+	allPkgs := append(append([]packages.Package(nil), pkgs...), extraPkgs...)
+	for _, v := range pkgs {
+		switch changedDirectories[path.Clean(v.Dir)] {
+		case LevelPackage:
+			addReason(v.ImportPath, LevelPackage, fmt.Sprintf("package changed %s", v.ImportPath))
+		case LevelTestOnly:
+			addReason(v.ImportPath, LevelTestOnly, fmt.Sprintf("tests changed %s", v.ImportPath))
+		}
 	}
 
 	changedCount := len(changedPackages)
+	more := 0
 	for {
-	out:
+		more = 0
 		for _, pkg := range allPkgs {
-			if changedPackages[pkg.ImportPath] && !why {
+			if changedPackages[pkg.ImportPath] < LevelPackage && !why {
 				continue
 			}
 			for _, importPath := range pkg.Imports {
-				if changedPackages[importPath] {
-					changedPackages[pkg.ImportPath] = true
-					addReason(pkg.ImportPath, whyChanged[importPath])
-					if !why {
-						continue out
-					}
+				if changedPackages[importPath] >= LevelPackage {
+					more += addReason(pkg.ImportPath, LevelPackage, importReasons(importPath)...)
 				}
 			}
 			for _, importPath := range pkg.TestImports {
-				if changedPackages[importPath] {
-					changedPackages[pkg.ImportPath] = true
-					addReason(pkg.ImportPath, whyChanged[importPath])
-					if !why {
-						continue out
-					}
+				if changedPackages[importPath] >= LevelPackage {
+					more += addReason(pkg.ImportPath, LevelTestOnly, importReasons(importPath)...)
 				}
 			}
 			for _, importPath := range pkg.XTestImports {
-				if changedPackages[importPath] {
-					changedPackages[pkg.ImportPath] = true
-					addReason(pkg.ImportPath, whyChanged[importPath])
-					if !why {
-						continue out
-					}
+				if changedPackages[importPath] >= LevelPackage {
+					more += addReason(pkg.ImportPath, LevelTestOnly, importReasons(importPath)...)
 				}
 			}
 		}
-		if changedCount == len(changedPackages) {
+		if changedCount == len(changedPackages) && more == 0 {
 			break
 		}
 		changedCount = len(changedPackages)
@@ -235,13 +273,17 @@ func main() {
 
 	for _, pkg := range pkgs {
 		importPath := pkg.ImportPath
-		if changedPackages[importPath] {
-			if why {
-				fmt.Printf("%s => %s\n", importPath, strings.Join(whyChanged[importPath], "\n	"))
-			} else {
-				fmt.Println(importPath)
-			}
+		if changedPackages[importPath] == LevelNone {
+			continue
 		}
+		if !why {
+			fmt.Println(importPath)
+			continue
+		}
+		reasons := whyChanged[importPath]
+		reasonList := append(reasons.PackageReasons.Values(), reasons.TestReasons.Values()...)
+		sort.Strings(reasonList)
+		fmt.Printf("%s => %s\n", importPath, strings.Join(reasonList, "\n	"))
 	}
 	os.Exit(0)
 }
