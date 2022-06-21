@@ -246,9 +246,6 @@ func main() {
 	for {
 		more = 0
 		for _, pkg := range allPkgs {
-			if changedPackages[pkg.ImportPath] < LevelPackage && !why {
-				continue
-			}
 			for _, importPath := range pkg.Imports {
 				if changedPackages[importPath] >= LevelPackage {
 					more += addReason(pkg.ImportPath, LevelPackage, importReasons(importPath)...)
