@@ -251,7 +251,7 @@ nextPackage:
 
 	for importPath := range extraNeedsTest {
 		needsTest[importPath] = true
-		whyChangedTests[importPath] = append(whyChangedTests[importPath], fmt.Sprintf("test deps changed"))
+		whyChangedTests[importPath] = append(whyChangedTests[importPath], "test deps changed")
 	}
 
 	for _, pkg := range pkgs {
@@ -275,6 +275,7 @@ nextPackage:
 	os.Exit(0)
 }
 
+// Copied from github.com/dominikbraun/graph (with modifications) which is licensed under Apache License.
 func ReverseDFS[K comparable, T any](g graph.Graph[K, T], start K, visit func(K) bool) error {
 	predMap, err := g.PredecessorMap()
 	if err != nil {
