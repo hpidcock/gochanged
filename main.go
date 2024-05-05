@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/juju/collections/set"
+	"github.com/dominikbraun/graph"
 	"github.com/juju/errors"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -19,28 +19,10 @@ import (
 	"github.com/hpidcock/gochanged/packages"
 )
 
-type ChangeLevel int
-
-const (
-	LevelNone ChangeLevel = iota
-	LevelTestOnly
-	LevelPackage
-)
-
-type Reasons struct {
-	PackageReasons set.Strings
-	TestReasons    set.Strings
-}
-
-func (r *Reasons) Set(level ChangeLevel) set.Strings {
-	switch level {
-	case LevelPackage:
-		return r.PackageReasons
-	case LevelTestOnly:
-		return r.TestReasons
-	default:
-		panic("invalid ChangeLevel")
-	}
+type P struct {
+	Path    string
+	Test    bool
+	Changed bool
 }
 
 func main() {
@@ -50,6 +32,9 @@ func main() {
 	flag.BoolVar(&why, "why", false, "explain why each package changed")
 	flag.Parse()
 	packagesFilter := flag.Args()
+	if len(packagesFilter) == 0 {
+		packagesFilter = []string{"./..."}
+	}
 
 	wd, err := os.Getwd()
 	if err != nil {
@@ -80,7 +65,7 @@ func main() {
 	}
 
 	if !strings.HasPrefix(commonModFile, gitRoot) {
-		fmt.Fprintf(os.Stderr, "go.mod is not under git root")
+		fmt.Fprintf(os.Stderr, "%s is not under git root %s", commonModFile, gitRoot)
 		os.Exit(1)
 	}
 	goModDir := path.Dir(commonModFile)
@@ -113,37 +98,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	changedDirectories := make(map[string]ChangeLevel)
-	changedPackages := make(map[string]ChangeLevel)
-	whyChanged := make(map[string]*Reasons)
-	addReason := func(importPath string, level ChangeLevel, newReasons ...string) int {
-		if changedPackages[importPath] < level {
-			changedPackages[importPath] = level
-		}
-		if !why {
-			return 0
-		}
-		reasons := whyChanged[importPath]
-		if reasons == nil {
-			reasons = &Reasons{
-				PackageReasons: set.NewStrings(),
-				TestReasons:    set.NewStrings(),
-			}
-			whyChanged[importPath] = reasons
-		}
-		s := reasons.Set(level)
-		count := len(s)
-		for _, reason := range newReasons {
-			s.Add(reason)
-		}
-		return len(s) - count
-	}
-	importReasons := func(importPath string) []string {
-		if reasons, ok := whyChanged[importPath]; ok && reasons != nil {
-			return reasons.PackageReasons.Values()
-		}
-		return nil
-	}
+	changedDirectories := make(map[string]bool)
+	changedDirectoriesTest := make(map[string]bool)
+	changedPackages := make(map[string]bool)
+	changedTestPackages := make(map[string]bool)
+	whyChanged := make(map[string][]string)
+	whyChangedTests := make(map[string][]string)
 
 	if workspace, err := packages.Workspace(build.Default, wd); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
@@ -151,7 +111,7 @@ func main() {
 	} else if workspace != "" {
 		for _, pkg := range packagesFilter {
 			if why {
-				fmt.Printf("%s => workspace mode", pkg)
+				fmt.Fprintf(os.Stderr, "%s => workspace mode", pkg)
 			} else {
 				fmt.Println(pkg)
 			}
@@ -162,7 +122,7 @@ func main() {
 	if currentMod.Go.Version != pastMod.Go.Version {
 		for _, pkg := range packagesFilter {
 			if why {
-				fmt.Printf("%s => go mod version changed", pkg)
+				fmt.Fprintf(os.Stderr, "%s => go mod version changed", pkg)
 			} else {
 				fmt.Println(pkg)
 			}
@@ -184,11 +144,13 @@ func main() {
 		importPath := dep.Mod.Path
 		pastVer, ok := pastRequires[importPath]
 		if !ok {
-			addReason(importPath, LevelPackage, fmt.Sprintf("new dep %s", importPath))
+			changedPackages[importPath] = true
+			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("new dep %s", importPath))
 			continue
 		}
 		if dep.Mod.Version != pastVer.Version {
-			addReason(importPath, LevelPackage, fmt.Sprintf("changed dep %s", importPath))
+			changedPackages[importPath] = true
+			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("changed dep %s", importPath))
 			continue
 		}
 	}
@@ -197,20 +159,23 @@ func main() {
 		importPath := rep.Old.Path
 		pastRep, ok := pastReplace[importPath]
 		if !ok {
-			addReason(importPath, LevelPackage, fmt.Sprintf("new replace %s", importPath))
+			changedPackages[importPath] = true
+			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("new replace %s", importPath))
 			continue
 		}
 		delete(pastReplace, importPath)
 		if rep.Old.Version != pastRep.Old.Version ||
 			rep.New.Path != pastRep.New.Path ||
 			rep.New.Version != pastRep.New.Version {
-			addReason(importPath, LevelPackage, fmt.Sprintf("changed replace %s", importPath))
+			changedPackages[importPath] = true
+			whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("changed replace %s", importPath))
 			continue
 		}
 	}
 	// Mark removed replaces as changed.
 	for importPath := range pastReplace {
-		addReason(importPath, LevelPackage, fmt.Sprintf("removed replace %s", importPath))
+		changedPackages[importPath] = true
+		whyChanged[importPath] = append(whyChanged[importPath], fmt.Sprintf("removed replace %s", importPath))
 	}
 
 	changedFiles, err := git.DiffNames(gitRoot, treeish)
@@ -219,68 +184,129 @@ func main() {
 		os.Exit(1)
 	}
 	for _, file := range changedFiles {
-		changeLevel := LevelPackage
 		dir := path.Dir(file)
 		if strings.Contains(strings.TrimPrefix(dir, goModDir), "testdata") {
-			changeLevel = LevelTestOnly
+			changedDirectoriesTest[dir] = true
 		} else if strings.HasSuffix(file, "_test.go") {
-			changeLevel = LevelTestOnly
-		}
-		if changeLevel > changedDirectories[dir] {
-			changedDirectories[dir] = changeLevel
+			changedDirectoriesTest[dir] = true
+		} else {
+			changedDirectories[dir] = true
 		}
 	}
 
 	allPkgs := append(append([]packages.Package(nil), pkgs...), extraPkgs...)
 	for _, v := range pkgs {
-		switch changedDirectories[path.Clean(v.Dir)] {
-		case LevelPackage:
-			addReason(v.ImportPath, LevelPackage, fmt.Sprintf("package changed %s", v.ImportPath))
-		case LevelTestOnly:
-			addReason(v.ImportPath, LevelTestOnly, fmt.Sprintf("tests changed %s", v.ImportPath))
+		dir := path.Clean(v.Dir)
+		if changedDirectories[dir] {
+			changedPackages[v.ImportPath] = true
+			whyChanged[v.ImportPath] = append(whyChanged[v.ImportPath], fmt.Sprintf("package changed %s", v.ImportPath))
+		}
+		if changedDirectoriesTest[dir] {
+			changedTestPackages[v.ImportPath] = true
+			whyChangedTests[v.ImportPath] = append(whyChangedTests[v.ImportPath], fmt.Sprintf("tests changed %s", v.ImportPath))
 		}
 	}
 
-	changedCount := len(changedPackages)
-	more := 0
-	for {
-		more = 0
-		for _, pkg := range allPkgs {
-			for _, importPath := range pkg.Imports {
-				if changedPackages[importPath] >= LevelPackage {
-					more += addReason(pkg.ImportPath, LevelPackage, importReasons(importPath)...)
-				}
-			}
-			for _, importPath := range pkg.TestImports {
-				if changedPackages[importPath] >= LevelPackage {
-					more += addReason(pkg.ImportPath, LevelTestOnly, importReasons(importPath)...)
-				}
-			}
-			for _, importPath := range pkg.XTestImports {
-				if changedPackages[importPath] >= LevelPackage {
-					more += addReason(pkg.ImportPath, LevelTestOnly, importReasons(importPath)...)
-				}
+	g := graph.New(graph.StringHash, graph.Directed(), graph.Acyclic())
+	for _, pkg := range allPkgs {
+		err := g.AddVertex(pkg.ImportPath)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	for _, pkg := range allPkgs {
+		for _, importPath := range pkg.Imports {
+			g.AddEdge(pkg.ImportPath, importPath)
+		}
+	}
+
+	needsTest := make(map[string]bool)
+	for _, pkg := range allPkgs {
+		if !changedPackages[pkg.ImportPath] {
+			continue
+		}
+		needsTest[pkg.ImportPath] = true
+		ReverseDFS(g, pkg.ImportPath, func(importPath string) bool {
+			needsTest[importPath] = true
+			return false
+		})
+	}
+
+	extraNeedsTest := make(map[string]bool)
+nextPackage:
+	for _, pkg := range allPkgs {
+		for _, importPath := range pkg.TestImports {
+			if needsTest[importPath] {
+				extraNeedsTest[pkg.ImportPath] = true
 			}
 		}
-		if changedCount == len(changedPackages) && more == 0 {
-			break
+		for _, importPath := range pkg.XTestImports {
+			if needsTest[importPath] {
+				extraNeedsTest[pkg.ImportPath] = true
+				continue nextPackage
+			}
 		}
-		changedCount = len(changedPackages)
+	}
+
+	for importPath := range extraNeedsTest {
+		needsTest[importPath] = true
+		whyChangedTests[importPath] = append(whyChangedTests[importPath], fmt.Sprintf("test deps changed"))
 	}
 
 	for _, pkg := range pkgs {
 		importPath := pkg.ImportPath
-		if changedPackages[importPath] == LevelNone {
+		if !needsTest[importPath] {
 			continue
 		}
 		if !why {
 			fmt.Println(importPath)
 			continue
 		}
-		reasons := whyChanged[importPath]
-		reasonList := append(reasons.PackageReasons.Values(), reasons.TestReasons.Values()...)
+		reasonList := append([]string(nil), whyChanged[importPath]...)
+		reasonList = append(reasonList, whyChangedTests[importPath]...)
+		graph.BFS(g, importPath, func(ip string) bool {
+			reasonList = append(reasonList, whyChanged[ip]...)
+			return false
+		})
 		sort.Strings(reasonList)
-		fmt.Printf("%s => %s\n", importPath, strings.Join(reasonList, "\n	"))
+		fmt.Fprintf(os.Stderr, "%s => %s\n", importPath, strings.Join(reasonList, "\n	"))
 	}
 	os.Exit(0)
+}
+
+func ReverseDFS[K comparable, T any](g graph.Graph[K, T], start K, visit func(K) bool) error {
+	predMap, err := g.PredecessorMap()
+	if err != nil {
+		return fmt.Errorf("could not get adjacency map: %w", err)
+	}
+
+	if _, ok := predMap[start]; !ok {
+		return fmt.Errorf("could not find start vertex with hash %v", start)
+	}
+
+	stack := make([]K, 0)
+	visited := make(map[K]bool)
+
+	stack = append(stack, start)
+
+	for len(stack) > 0 {
+		currentHash := stack[len(stack)-1]
+
+		stack = stack[:len(stack)-1]
+
+		if _, ok := visited[currentHash]; !ok {
+			// Stop traversing the graph if the visit function returns true.
+			if stop := visit(currentHash); stop {
+				break
+			}
+			visited[currentHash] = true
+
+			for adjacency := range predMap[currentHash] {
+				stack = append(stack, adjacency)
+			}
+		}
+	}
+
+	return nil
 }
